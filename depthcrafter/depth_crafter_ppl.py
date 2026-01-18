@@ -2,6 +2,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
+import cv2  # <--- 修正: 確保在頂層導入 cv2
 
 from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import (
     _resize_with_antialiasing,
@@ -77,20 +78,15 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     @staticmethod
     def check_inputs(video, height, width):
         """
-        :param video:
-        :param height:
-        :param width:
-        :return:
+        Check inputs.
         """
         if not isinstance(video, torch.Tensor) and not isinstance(video, np.ndarray):
             raise ValueError(
                 f"Expected `video` to be a `torch.Tensor` or `VideoReader`, but got a {type(video)}"
             )
 
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(
-                f"`height` and `width` have to be divisible by 8 but are {height} and {width}."
-            )
+        # AMD Fix: 這裡的檢查可以放寬，因為我們會在後面強制 resize
+        pass 
 
     @torch.no_grad()
     def __call__(
@@ -113,28 +109,34 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         track_time: bool = False,
         progress_callback: Optional[Callable] = None,
     ):
-        """
-        :param video: in shape [t, h, w, c] if np.ndarray or [t, c, h, w] if torch.Tensor, in range [0, 1]
-        :param height:
-        :param width:
-        :param num_inference_steps:
-        :param guidance_scale:
-        :param window_size: sliding window processing size
-        :param fps:
-        :param motion_bucket_id:
-        :param noise_aug_strength:
-        :param decode_chunk_size:
-        :param generator:
-        :param latents:
-        :param output_type:
-        :param callback_on_step_end:
-        :param callback_on_step_end_tensor_inputs:
-        :param return_dict:
-        :return:
-        """
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # ================= AMD GFX1151 FIX 1: Resize (Force Multiple of 64) =================
+        def make_multiple_of_64(val):
+            return ((val + 63) // 64) * 64
+
+        original_height, original_width = height, width
+        height = make_multiple_of_64(height)
+        width = make_multiple_of_64(width)
+
+        if height != original_height or width != original_width:
+             print(f"AMD Fix: Resizing input from {original_width}x{original_height} to {width}x{height} (multiples of 64)")
+             
+             # 如果輸入是 Tensor，假設格式為 NCHW (符合 diffusers 標準)
+             if isinstance(video, torch.Tensor):
+                 # <--- 修正: 直接 resize，不需要 permute，避免導致花屏
+                 video = _resize_with_antialiasing(video, (height, width))
+                 
+             # 如果輸入是 Numpy，假設格式為 NHWC
+             elif isinstance(video, np.ndarray):
+                 new_video = []
+                 for frame in video:
+                    new_video.append(cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4))
+                 video = np.array(new_video)
+        # ==============================================================================
+
         num_frames = video.shape[0]
         decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else 8
         if num_frames <= window_size:
@@ -142,15 +144,22 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             overlap = 0
         stride = window_size - overlap
 
-        # 1. Check inputs. Raise error if not correct
+        # 1. Check inputs
         self.check_inputs(video, height, width)
 
+        # ================= AMD GFX1151 FIX 2: Disable Flash Attention =================
+        # 這是解決 HIPBLAS_STATUS_INVALID_VALUE 的關鍵
+        try:
+             self.unet.set_default_attn_processor()
+             self.vae.set_default_attn_processor()
+             print("AMD Fix: Forced Default Attention Processor (Disabled Flash Attention)")
+        except Exception as e:
+             print(f"Warning: Could not set default attention processor: {e}")
+        # ==============================================================================
+        
         # 2. Define call parameters
         batch_size = 1
         device = self._execution_device
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
         self._guidance_scale = guidance_scale
 
         # 3. Encode input video
@@ -249,8 +258,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
 
         torch.cuda.empty_cache()
 
-        # inference strategy for long videos
-        # two main strategies: 1. noise init from previous frame, 2. segments stitching
         while idx_start < num_frames - overlap:
             idx_end = min(idx_start + window_size, num_frames)
             self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -335,9 +342,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 latents_all = latents.clone()
             else:
                 assert weights is not None
-                # latents_all[:, -overlap:] = (
-                #     latents[:, :overlap] + latents_all[:, -overlap:]
-                # ) / 2.0
                 latents_all[:, -overlap:] = latents[
                     :, :overlap
                 ] * weights + latents_all[:, -overlap:] * (1 - weights)
@@ -352,36 +356,22 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             print(f"Elapsed time for denoising video: {elapsed_time_ms} ms")
 
         if not output_type == "latent":
-            # cast back to fp16 if needed
-            # if needs_upcasting:
-            #     self.vae.to(dtype=torch.float16)
-            #     latents_all = latents_all.to(dtype=torch.float16)
-            
             latents_all = latents_all.to(dtype=self.vae.dtype)
 
-            # ================= AMD GFX1151 FIX START =================
+            # ================= AMD GFX1151 FIX 3: VAE Tiling =================
             try:
-                # 啟用 Tiling
                 self.vae.enable_tiling()
                 
-                # --- 用戶設定區 ---
-                # 建議 1: 先嘗試 512。如果 2K 運行時當機，請改回 256。
-                # 256 是 PDF 文檔建議的 Strix Halo 安全數值。
+                # 安全設定
                 TARGET_TILE_SIZE = 512 
-                
-                # 建議 2: 增加 Overlap。標準通常是 tile_size / 4 或 / 8。
-                # 為了深度圖的連續性，我們設大一點 (例如 128)，確保接縫看不出來。
                 TARGET_OVERLAP = 128 
-                # ----------------
                 
                 if hasattr(self.vae, "tile_sample_min_size"):
                     self.vae.tile_sample_min_size = TARGET_TILE_SIZE
                 
-                # 對應 latent 空間的大小 (512/8 = 64)
                 if hasattr(self.vae, "tile_latent_min_size"): 
                     self.vae.tile_latent_min_size = int(TARGET_TILE_SIZE / 8)
                 
-                # 設定 overlap，避免深度圖出現斷層
                 if hasattr(self.vae, "tile_overlap"): 
                     self.vae.tile_overlap = TARGET_OVERLAP
                     
@@ -390,15 +380,13 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             except Exception as e:
                 print(f"Warning: Failed to enable VAE tiling: {e}")
 
-            # 執行解碼
             frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
 
-            # 解碼完畢後關閉
             try:
                 self.vae.disable_tiling()
             except:
                 pass
-            # ================= AMD GFX1151 FIX END ===================
+            # =================================================================
 
             if track_time:
                 decode_event.record()
