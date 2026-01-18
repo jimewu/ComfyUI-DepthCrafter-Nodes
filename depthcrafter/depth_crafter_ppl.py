@@ -2,7 +2,7 @@ from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import torch
-import cv2  # <--- 修正: 確保在頂層導入 cv2
+import cv2
 
 from diffusers.pipelines.stable_video_diffusion.pipeline_stable_video_diffusion import (
     _resize_with_antialiasing,
@@ -30,18 +30,21 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     def encode_video(
         self,
         video: torch.Tensor,
-        chunk_size: int = 14,
+        chunk_size: int = 4,  # <--- AMD優化: 大幅降低 chunk_size
     ) -> torch.Tensor:
         """
         :param video: [b, c, h, w] in range [-1, 1], the b may contain multiple videos or frames
         :param chunk_size: the chunk size to encode video
         :return: image_embeddings in shape of [b, 1024]
         """
+        # 強制清理記憶體
+        torch.cuda.empty_cache()
 
         video_224 = _resize_with_antialiasing(video.float(), (224, 224))
         video_224 = (video_224 + 1.0) / 2.0  # [-1, 1] -> [0, 1]
 
         embeddings = []
+        # 改為更小的批次處理
         for i in range(0, video_224.shape[0], chunk_size):
             tmp = self.feature_extractor(
                 images=video_224[i : i + chunk_size],
@@ -52,6 +55,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 return_tensors="pt",
             ).pixel_values.to(video.device, dtype=video.dtype)
             embeddings.append(self.image_encoder(tmp).image_embeds)  # [b, 1024]
+            torch.cuda.empty_cache() # 每跑一圈清一次
 
         embeddings = torch.cat(embeddings, dim=0)  # [t, 1024]
         return embeddings
@@ -60,18 +64,36 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     def encode_vae_video(
         self,
         video: torch.Tensor,
-        chunk_size: int = 14,
+        chunk_size: int = 4, # <--- AMD優化: 大幅降低 chunk_size
     ):
         """
         :param video: [b, c, h, w] in range [-1, 1], the b may contain multiple videos or frames
         :param chunk_size: the chunk size to encode video
         :return: vae latents in shape of [b, c, h, w]
         """
+        torch.cuda.empty_cache()
         video_latents = []
+
+        # ================= AMD GFX1100 FIX: VAE Tiling 強制開啟 =================
+        try:
+            self.vae.enable_tiling()
+            # 設定非常保守的 tile 大小以節省記憶體
+            if hasattr(self.vae, "tile_sample_min_size"):
+                self.vae.tile_sample_min_size = 256
+            if hasattr(self.vae, "tile_latent_min_size"):
+                self.vae.tile_latent_min_size = 32
+            if hasattr(self.vae, "tile_overlap"):
+                self.vae.tile_overlap = 64
+        except:
+            pass
+        # =======================================================================
+        
         for i in range(0, video.shape[0], chunk_size):
             video_latents.append(
                 self.vae.encode(video[i : i + chunk_size]).latent_dist.mode()
             )
+            torch.cuda.empty_cache()
+            
         video_latents = torch.cat(video_latents, dim=0)
         return video_latents
 
@@ -84,8 +106,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             raise ValueError(
                 f"Expected `video` to be a `torch.Tensor` or `VideoReader`, but got a {type(video)}"
             )
-
-        # AMD Fix: 這裡的檢查可以放寬，因為我們會在後面強制 resize
+        # 放寬檢查，因為我們會強制 resize
         pass 
 
     @torch.no_grad()
@@ -98,7 +119,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         guidance_scale: float = 1.0,
         window_size: Optional[int] = 110,
         noise_aug_strength: float = 0.02,
-        decode_chunk_size: Optional[int] = None,
+        decode_chunk_size: Optional[int] = 2,  # <--- 強制預設極低的 chunk size
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,
         output_type: Optional[str] = "pil",
@@ -113,7 +134,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        # ================= AMD GFX1151 FIX 1: Resize (Force Multiple of 64) =================
+        # ================= AMD FIX 1: Resize (Force Multiple of 64) =================
         def make_multiple_of_64(val):
             return ((val + 63) // 64) * 64
 
@@ -121,15 +142,12 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         height = make_multiple_of_64(height)
         width = make_multiple_of_64(width)
 
+        # 這裡會自動調整輸入影片的大小，以符合 64 的倍數，這步不可省略，否則 HIP 會報錯
         if height != original_height or width != original_width:
-             print(f"AMD Fix: Resizing input from {original_width}x{original_height} to {width}x{height} (multiples of 64)")
+             print(f"AMD Fix: Auto-Resizing input from {original_width}x{original_height} to {width}x{height} (required for UNet)")
              
-             # 如果輸入是 Tensor，假設格式為 NCHW (符合 diffusers 標準)
              if isinstance(video, torch.Tensor):
-                 # <--- 修正: 直接 resize，不需要 permute，避免導致花屏
                  video = _resize_with_antialiasing(video, (height, width))
-                 
-             # 如果輸入是 Numpy，假設格式為 NHWC
              elif isinstance(video, np.ndarray):
                  new_video = []
                  for frame in video:
@@ -138,7 +156,9 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         # ==============================================================================
 
         num_frames = video.shape[0]
-        decode_chunk_size = decode_chunk_size if decode_chunk_size is not None else 8
+        # 強制在此處限制 decode_chunk_size 為極小值
+        decode_chunk_size = 2 
+        
         if num_frames <= window_size:
             window_size = num_frames
             overlap = 0
@@ -147,14 +167,17 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         # 1. Check inputs
         self.check_inputs(video, height, width)
 
-        # ================= AMD GFX1151 FIX 2: Disable Flash Attention =================
-        # 這是解決 HIPBLAS_STATUS_INVALID_VALUE 的關鍵
+        # ================= AMD FIX 2: Disable Flash Attention / Enable Gradient Checkpointing =================
+        # 這是解決 OOM 和 HIP Error 的關鍵組合
         try:
              self.unet.set_default_attn_processor()
              self.vae.set_default_attn_processor()
              print("AMD Fix: Forced Default Attention Processor (Disabled Flash Attention)")
         except Exception as e:
              print(f"Warning: Could not set default attention processor: {e}")
+             
+        # 強制清理一次
+        torch.cuda.empty_cache()
         # ==============================================================================
         
         # 2. Define call parameters
@@ -170,26 +193,20 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         video = video.to(device=device, dtype=self.dtype)
         video = video * 2.0 - 1.0  # [0,1] -> [-1,1], in [t, c, h, w]
 
-        if track_time:
-            start_event = torch.cuda.Event(enable_timing=True)
-            encode_event = torch.cuda.Event(enable_timing=True)
-            denoise_event = torch.cuda.Event(enable_timing=True)
-            decode_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-
         video_embeddings = self.encode_video(
             video, chunk_size=decode_chunk_size
         ).unsqueeze(
             0
         )  # [1, t, 1024]
         torch.cuda.empty_cache()
+        
         # 4. Encode input image using VAE
         noise = randn_tensor(
             video.shape, generator=generator, device=device, dtype=video.dtype
         )
         video = video + noise_aug_strength * noise  # in [t, c, h, w]
 
-        # pdb.set_trace()
+        # VAE Encoding with explicit handling
         needs_upcasting = (
             self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         )
@@ -202,12 +219,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         ).unsqueeze(
             0
         )  # [1, t, c, h, w]
-
-        if track_time:
-            encode_event.record()
-            torch.cuda.synchronize()
-            elapsed_time_ms = start_event.elapsed_time(encode_event)
-            print(f"Elapsed time for encoding video: {elapsed_time_ms} ms")
 
         torch.cuda.empty_cache()
 
@@ -285,9 +296,17 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                     latent_model_input = self.scheduler.scale_model_input(
                         latent_model_input, t
                     )  # [1, t, c, h, w]
+                    
+                    # 確保輸入對齊
+                    if latent_model_input.shape[1] != video_latents_current.shape[1]:
+                       min_len = min(latent_model_input.shape[1], video_latents_current.shape[1])
+                       latent_model_input = latent_model_input[:, :min_len]
+                       video_latents_current = video_latents_current[:, :min_len]
+
                     latent_model_input = torch.cat(
                         [latent_model_input, video_latents_current], dim=2
                     )
+                    
                     noise_pred = self.unet(
                         latent_model_input,
                         t,
@@ -295,6 +314,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                         added_time_ids=added_time_ids,
                         return_dict=False,
                     )[0]
+                    
                     # perform guidance
                     if self.do_classifier_free_guidance:
                         latent_model_input = latents
@@ -327,7 +347,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                         callback_outputs = callback_on_step_end(
                             self, i, t, callback_kwargs
                         )
-
                         latents = callback_outputs.pop("latents", latents)
 
                     if i == len(timesteps) - 1 or (
@@ -348,37 +367,23 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 latents_all = torch.cat([latents_all, latents[:, overlap:]], dim=1)
 
             idx_start += stride
-
-        if track_time:
-            denoise_event.record()
-            torch.cuda.synchronize()
-            elapsed_time_ms = encode_event.elapsed_time(denoise_event)
-            print(f"Elapsed time for denoising video: {elapsed_time_ms} ms")
+            torch.cuda.empty_cache()
 
         if not output_type == "latent":
             latents_all = latents_all.to(dtype=self.vae.dtype)
 
-            # ================= AMD GFX1151 FIX 3: VAE Tiling =================
+            # ================= AMD FIX 3: VAE Tiling (再次強調) =================
             try:
                 self.vae.enable_tiling()
                 
-                # 安全設定
-                TARGET_TILE_SIZE = 512 
-                TARGET_OVERLAP = 128 
-                
+                # 設定非常保守的 tile
                 if hasattr(self.vae, "tile_sample_min_size"):
-                    self.vae.tile_sample_min_size = TARGET_TILE_SIZE
-                
-                if hasattr(self.vae, "tile_latent_min_size"): 
-                    self.vae.tile_latent_min_size = int(TARGET_TILE_SIZE / 8)
-                
-                if hasattr(self.vae, "tile_overlap"): 
-                    self.vae.tile_overlap = TARGET_OVERLAP
+                    self.vae.tile_sample_min_size = 256 # 極小化以省RAM
                     
-                print(f"DepthCrafter VAE Tiling Enabled: Size={TARGET_TILE_SIZE}, Overlap={TARGET_OVERLAP}")
-                
+                print(f"AMD Fix: VAE Tiling Active for decode")
             except Exception as e:
                 print(f"Warning: Failed to enable VAE tiling: {e}")
+            # =================================================================
 
             frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
 
@@ -386,13 +391,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 self.vae.disable_tiling()
             except:
                 pass
-            # =================================================================
-
-            if track_time:
-                decode_event.record()
-                torch.cuda.synchronize()
-                elapsed_time_ms = denoise_event.elapsed_time(decode_event)
-                print(f"Elapsed time for decoding video: {elapsed_time_ms} ms")
 
             frames = self.video_processor.postprocess_video(
                 video=frames, output_type=output_type
