@@ -356,41 +356,44 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             # if needs_upcasting:
             #     self.vae.to(dtype=torch.float16)
             #     latents_all = latents_all.to(dtype=torch.float16)
-            latents_all = latents_all.to(dtype=self.vae.dtype)
-            frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
-
-        if not output_type == "latent":
-            # cast back to fp16 if needed
-            # if needs_upcasting:
-            #     self.vae.to(dtype=torch.float16)
-            #     latents_all = latents_all.to(dtype=torch.float16)
             
             latents_all = latents_all.to(dtype=self.vae.dtype)
 
             # ================= AMD GFX1151 FIX START =================
-            # 強制啟用 VAE Tiling 以防止 2K 解析度導致 GPU Hang
-            # 這對應於文檔中提到的 VAEDecodeTiled 功能
             try:
                 # 啟用 Tiling
                 self.vae.enable_tiling()
                 
-                # 依照你的 PDF 文檔建議，將 Tile Size 設為 256 (預設通常是 512)
-                # 這能進一步降低 VRAM 峰值壓力避免崩潰
+                # --- 用戶設定區 ---
+                # 建議 1: 先嘗試 512。如果 2K 運行時當機，請改回 256。
+                # 256 是 PDF 文檔建議的 Strix Halo 安全數值。
+                TARGET_TILE_SIZE = 512 
+                
+                # 建議 2: 增加 Overlap。標準通常是 tile_size / 4 或 / 8。
+                # 為了深度圖的連續性，我們設大一點 (例如 128)，確保接縫看不出來。
+                TARGET_OVERLAP = 128 
+                # ----------------
+                
                 if hasattr(self.vae, "tile_sample_min_size"):
-                    self.vae.tile_sample_min_size = 256
-                if hasattr(self.vae, "tile_latent_min_size"): # 對應 latent 空間的大小 (256/8 = 32)
-                    self.vae.tile_latent_min_size = 32
-                if hasattr(self.vae, "tile_overlap"): # 設定 overlap，避免接縫
-                    self.vae.tile_overlap = 64 # 對應文檔建議的 overlap
+                    self.vae.tile_sample_min_size = TARGET_TILE_SIZE
+                
+                # 對應 latent 空間的大小 (512/8 = 64)
+                if hasattr(self.vae, "tile_latent_min_size"): 
+                    self.vae.tile_latent_min_size = int(TARGET_TILE_SIZE / 8)
+                
+                # 設定 overlap，避免深度圖出現斷層
+                if hasattr(self.vae, "tile_overlap"): 
+                    self.vae.tile_overlap = TARGET_OVERLAP
                     
-                print("Flux/SVD VAE Tiling Enabled for AMD GPU (Size: 256)")
+                print(f"DepthCrafter VAE Tiling Enabled: Size={TARGET_TILE_SIZE}, Overlap={TARGET_OVERLAP}")
+                
             except Exception as e:
                 print(f"Warning: Failed to enable VAE tiling: {e}")
 
-            # 執行解碼 (此時內部會自動切塊處理)
+            # 執行解碼
             frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
 
-            # 解碼完畢後關閉 Tiling，以免影響後續流程 (雖然通常沒差)
+            # 解碼完畢後關閉
             try:
                 self.vae.disable_tiling()
             except:
@@ -406,6 +409,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             frames = self.video_processor.postprocess_video(
                 video=frames, output_type=output_type
             )
+
         else:
             frames = latents_all
 
