@@ -359,6 +359,44 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             latents_all = latents_all.to(dtype=self.vae.dtype)
             frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
 
+        if not output_type == "latent":
+            # cast back to fp16 if needed
+            # if needs_upcasting:
+            #     self.vae.to(dtype=torch.float16)
+            #     latents_all = latents_all.to(dtype=torch.float16)
+            
+            latents_all = latents_all.to(dtype=self.vae.dtype)
+
+            # ================= AMD GFX1151 FIX START =================
+            # 強制啟用 VAE Tiling 以防止 2K 解析度導致 GPU Hang
+            # 這對應於文檔中提到的 VAEDecodeTiled 功能
+            try:
+                # 啟用 Tiling
+                self.vae.enable_tiling()
+                
+                # 依照你的 PDF 文檔建議，將 Tile Size 設為 256 (預設通常是 512)
+                # 這能進一步降低 VRAM 峰值壓力避免崩潰
+                if hasattr(self.vae, "tile_sample_min_size"):
+                    self.vae.tile_sample_min_size = 256
+                if hasattr(self.vae, "tile_latent_min_size"): # 對應 latent 空間的大小 (256/8 = 32)
+                    self.vae.tile_latent_min_size = 32
+                if hasattr(self.vae, "tile_overlap"): # 設定 overlap，避免接縫
+                    self.vae.tile_overlap = 64 # 對應文檔建議的 overlap
+                    
+                print("Flux/SVD VAE Tiling Enabled for AMD GPU (Size: 256)")
+            except Exception as e:
+                print(f"Warning: Failed to enable VAE tiling: {e}")
+
+            # 執行解碼 (此時內部會自動切塊處理)
+            frames = self.decode_latents(latents_all, num_frames, decode_chunk_size)
+
+            # 解碼完畢後關閉 Tiling，以免影響後續流程 (雖然通常沒差)
+            try:
+                self.vae.disable_tiling()
+            except:
+                pass
+            # ================= AMD GFX1151 FIX END ===================
+
             if track_time:
                 decode_event.record()
                 torch.cuda.synchronize()
