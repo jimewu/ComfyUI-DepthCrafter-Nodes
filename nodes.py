@@ -7,7 +7,6 @@ from comfy.utils import ProgressBar
 import folder_paths
 
 from .depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
-from .depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
 
 
 def aggressive_cleanup():
@@ -46,7 +45,7 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
     RETURN_NAMES = ("depthcrafter_model",)
     FUNCTION = "load_model"
     DESCRIPTION = """
-下載並載入 DepthCrafter 模型 (V7)
+下載並載入 DepthCrafter 模型 (V8)
 
 【AMD AI MAX+ 395 建議設定】
 • enable_model_cpu_offload: ✅ 開啟
@@ -54,6 +53,9 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
 """
 
     def load_model(self, enable_model_cpu_offload, enable_sequential_cpu_offload):
+        # 延遲導入以避免循環依賴
+        from .depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
+        
         device = mm.get_torch_device()
 
         model_dir = os.path.join(folder_paths.models_dir, "depthcrafter")
@@ -106,19 +108,36 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
                 )
                 self.update_progress()
 
+        # 載入 UNet
         unet = DiffusersUNetSpatioTemporalConditionModelDepthCrafter.from_pretrained(
             unet_path,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
         )
 
-        pipe = DepthCrafterPipeline.from_pretrained(
+        # 關鍵修復：使用正確的方式載入 pipeline
+        # 不覆寫 from_pretrained，而是先載入 base pipeline 再替換 unet
+        from diffusers import StableVideoDiffusionPipeline
+        
+        base_pipe = StableVideoDiffusionPipeline.from_pretrained(
             pretrain_path,
-            unet=unet,
             torch_dtype=torch.float16,
             variant="fp16",
             low_cpu_mem_usage=True,
         )
+        
+        # 創建 DepthCrafterPipeline 實例，直接傳入組件
+        pipe = DepthCrafterPipeline(
+            vae=base_pipe.vae,
+            image_encoder=base_pipe.image_encoder,
+            unet=unet,  # 使用 DepthCrafter 的 UNet
+            scheduler=base_pipe.scheduler,
+            feature_extractor=base_pipe.feature_extractor,
+        )
+        
+        # 清理 base_pipe
+        del base_pipe
+        aggressive_cleanup()
         
         if enable_model_cpu_offload:
             pipe.enable_model_cpu_offload()
@@ -167,13 +186,13 @@ class DepthCrafter(DepthCrafterNode):
                 "window_size_override": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "max": 100,
+                    "max": 200,  # 增加上限
                     "tooltip": "手動設定 window_size。0 = 自動。"
                 }),
                 "spatial_tile_size_override": ("INT", {
                     "default": 0,
                     "min": 0,
-                    "max": 1536,
+                    "max": 2048,  # 增加上限
                     "step": 64,
                     "tooltip": "手動設定 tile_size。0 = 自動。"
                 }),
@@ -196,11 +215,11 @@ class DepthCrafter(DepthCrafterNode):
     RETURN_NAMES = ("depth_maps",)
     FUNCTION = "process"
     DESCRIPTION = """
-DepthCrafter V7 - AMD AI MAX+ 395 優化版本
+DepthCrafter V8 - AMD AI MAX+ 395 優化版本
 
 【關鍵修復】
+• 修復 from_pretrained 載入問題
 • 強制 VAE 使用 float32 進行編碼/解碼
-• 修復維度處理錯誤
 • 更穩定的數值處理
 
 【建議設定】
@@ -298,17 +317,13 @@ DepthCrafter V7 - AMD AI MAX+ 395 優化版本
         # 處理不同的輸出形狀
         print(f"[DepthCrafter] 輸出形狀: {res.shape}")
         
-        # 確保是 [B, H, W, C] 或 [B, C, H, W] 格式
         if res.dim() == 5:
-            # [1, B, C, H, W] -> [B, C, H, W]
             res = res.squeeze(0)
         
         if res.dim() == 4:
             if res.shape[1] == 3:
-                # [B, C, H, W] -> [B, H, W, C]
                 res = res.permute(0, 2, 3, 1)
         
-        # 現在應該是 [B, H, W, C]
         print(f"[DepthCrafter] 處理後形狀: {res.shape}")
         
         # 修復無效值
@@ -321,13 +336,10 @@ DepthCrafter V7 - AMD AI MAX+ 395 優化版本
         
         # 轉換為灰階深度圖
         if res.dim() == 4 and res.shape[-1] == 3:
-            # [B, H, W, 3] -> [B, H, W]
             res = res.mean(dim=-1)
         elif res.dim() == 4 and res.shape[-1] == 1:
-            # [B, H, W, 1] -> [B, H, W]
             res = res.squeeze(-1)
         elif res.dim() == 3:
-            # 已經是 [B, H, W]
             pass
         else:
             print(f"[DepthCrafter] 警告: 未預期的輸出形狀 {res.shape}")
@@ -350,8 +362,8 @@ DepthCrafter V7 - AMD AI MAX+ 395 優化版本
             res = res.unsqueeze(0)
         
         # 擴展為 RGB [B, H, W, 3]
-        depth_maps = res.unsqueeze(-1).expand(-1, -1, -1, 3)
-        depth_maps = depth_maps.float().cpu().contiguous()
+        depth_maps = res.unsqueeze(-1).expand(-1, -1, -1, 3).contiguous()
+        depth_maps = depth_maps.float().cpu()
         
         print(f"[DepthCrafter] 最終輸出形狀: {depth_maps.shape}")
         
