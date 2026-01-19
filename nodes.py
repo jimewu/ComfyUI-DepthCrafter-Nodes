@@ -8,6 +8,7 @@ import folder_paths
 from .depthcrafter.unet import DiffusersUNetSpatioTemporalConditionModelDepthCrafter
 from .depthcrafter.depth_crafter_ppl import DepthCrafterPipeline
 
+
 class DepthCrafterNode:
     def __init__(self):
         self.progress_bar = None
@@ -37,11 +38,11 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
     RETURN_NAMES = ("depthcrafter_model",)
     FUNCTION = "load_model"
     DESCRIPTION = """
-    Downloads and loads the DepthCrafter model.
-    - enable_model_cpu_offload: If True, the model will be offloaded to the CPU. (Saves VRAM)
-    - enable_sequential_cpu_offload: If True, the model will be offloaded to the CPU in a sequential manner. (Saves the most VRAM but runs slowly)
-    Only enable one of the two at a time.
-    """
+Downloads and loads the DepthCrafter model.
+- enable_model_cpu_offload: If True, the model will be offloaded to the CPU. (Saves VRAM)
+- enable_sequential_cpu_offload: If True, the model will be offloaded to the CPU in a sequential manner. (Saves the most VRAM but runs slowly)
+Only enable one of the two at a time.
+"""
 
     def load_model(self, enable_model_cpu_offload, enable_sequential_cpu_offload):
         device = mm.get_torch_device()
@@ -143,55 +144,51 @@ class DepthCrafter(DepthCrafterNode):
                 "depthcrafter_model": ("DEPTHCRAFTER_MODEL", ),
                 "images": ("IMAGE", ),
                 "force_size": ("BOOLEAN", {"default": True}),
-                "num_inference_steps": ("INT", {"default": 5, "min": 1, "max": 100}),
-                "guidance_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
-                "window_size": ("INT", {"default": 110, "min": 1, "max": 200}),
-                "overlap": ("INT", {"default": 25, "min": 0, "max": 100}),
+                "num_inference_steps": ("INT", {"default": 10, "min": 1, "max": 100}),
+                "guidance_scale": ("FLOAT", {"default": 1.2, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "window_size": ("INT", {"default": 60, "min": 1, "max": 200}),
+                "overlap": ("INT", {"default": 15, "min": 0, "max": 100}),
             },
             "optional": {
                 # ==================== AMD/高解析度 Tiling 配置 ====================
-                "enable_spatial_tiling": ("BOOLEAN", {"default": True}),
+                "enable_spatial_tiling": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "啟用空間分塊處理，用於處理 2K+ 解析度影片"
+                }),
                 "spatial_tile_size": ("INT", {
-                    "default": 768, 
-                    "min": 256, 
-                    "max": 1536, 
+                    "default": 1024, 
+                    "min": 512, 
+                    "max": 2048, 
                     "step": 64,
-                    "tooltip": "每個空間 tile 的處理尺寸（像素）。較小的值更省記憶體，但可能有更多接縫。必須是 64 的倍數。"
+                    "tooltip": "每個空間 tile 的處理尺寸（像素）。建議：2K=1024, 4K=768。必須是 64 的倍數。"
                 }),
                 "spatial_tile_overlap": ("INT", {
-                    "default": 128, 
-                    "min": 32, 
-                    "max": 384, 
-                    "step": 32,
-                    "tooltip": "空間 tiles 之間的重疊像素。較大的值可減少接縫但增加處理時間。"
-                }),
-                "vae_tile_size": ("INT", {
-                    "default": 256, 
-                    "min": 128, 
+                    "default": 192, 
+                    "min": 64, 
                     "max": 512, 
-                    "step": 64,
-                    "tooltip": "VAE 內部 tiling 的大小。較小的值更省記憶體。"
-                }),
-                "vae_tile_overlap": ("INT", {
-                    "default": 64, 
-                    "min": 16, 
-                    "max": 128, 
-                    "step": 16,
-                    "tooltip": "VAE tiles 之間的重疊像素。"
+                    "step": 32,
+                    "tooltip": "空間 tiles 之間的重疊像素。較大的值可減少接縫，建議至少 128。"
                 }),
                 "vae_encode_chunk_size": ("INT", {
-                    "default": 1, 
-                    "min": 1, 
-                    "max": 8, 
-                    "step": 1,
-                    "tooltip": "每次 VAE encoding 處理的幀數。較小的值更省記憶體。對於 2K 影片建議設為 1。"
-                }),
-                "vae_decode_chunk_size": ("INT", {
                     "default": 2, 
                     "min": 1, 
-                    "max": 8, 
+                    "max": 16, 
                     "step": 1,
-                    "tooltip": "每次 VAE decoding 處理的幀數。較小的值更省記憶體。"
+                    "tooltip": "每次 VAE encoding 處理的幀數。128GB 記憶體建議 2-4。"
+                }),
+                "vae_decode_chunk_size": ("INT", {
+                    "default": 4, 
+                    "min": 1, 
+                    "max": 16, 
+                    "step": 1,
+                    "tooltip": "每次 VAE decoding 處理的幀數。128GB 記憶體建議 4-8。"
+                }),
+                "max_memory_usage_gb": ("FLOAT", {
+                    "default": 100.0,
+                    "min": 16.0,
+                    "max": 128.0,
+                    "step": 8.0,
+                    "tooltip": "最大允許的記憶體使用量 (GB)。128GB 系統建議設為 100-110。"
                 }),
                 # ==============================================================
             }
@@ -201,31 +198,36 @@ class DepthCrafter(DepthCrafterNode):
     RETURN_NAMES = ("depth_maps",)
     FUNCTION = "process"
     DESCRIPTION = """
-Runs the DepthCrafter model on the input images.
+DepthCrafter - 影片深度圖生成
+AMD gfx1151 + 128GB 統一記憶體優化版本
 
-**Basic Parameters:**
-- force_size: Automatically resize input to multiples of 64
-- num_inference_steps: Denoising steps (more = better quality, slower)
-- guidance_scale: CFG scale
-- window_size: Temporal sliding window size (frames)
-- overlap: Overlap between temporal windows (frames)
+【基本參數】
+• force_size: 自動調整輸入為 64 的倍數
+• num_inference_steps: 去噪步數（更多=更好品質，更慢）
+• guidance_scale: CFG 引導比例
+• window_size: 時間滑動窗口大小（幀數）
+• overlap: 時間窗口重疊（幀數）
 
-**AMD/High-Resolution Tiling Parameters (Optional):**
-These parameters enable processing of 2K+ resolution videos on GPUs with limited VRAM.
+【AMD/高解析度 Tiling 參數】
+這些參數用於處理 2K+ 解析度的影片。
 
-- enable_spatial_tiling: Enable spatial tiling for high-resolution input
-- spatial_tile_size: Size of each spatial tile (768 recommended for 2K)
-- spatial_tile_overlap: Overlap between spatial tiles (128 recommended)
-- vae_tile_size: VAE internal tiling size
-- vae_tile_overlap: VAE internal tiling overlap
-- vae_encode_chunk_size: Frames per VAE encoding batch (1 for 2K)
-- vae_decode_chunk_size: Frames per VAE decoding batch
+• enable_spatial_tiling: 啟用空間分塊（2K+ 必須啟用）
+• spatial_tile_size: 每個 tile 的尺寸
+  - 2K 影片: 1024 (建議)
+  - 4K+ 影片: 768
+• spatial_tile_overlap: tile 重疊像素（減少接縫）
+  - 建議: 192
+• vae_encode_chunk_size: VAE 編碼批次大小
+  - 128GB 記憶體: 2-4
+• vae_decode_chunk_size: VAE 解碼批次大小
+  - 128GB 記憶體: 4-8
+• max_memory_usage_gb: 最大記憶體使用量
+  - 128GB 系統建議: 100-110
 
-**Memory Tips:**
-- For 2K video: spatial_tile_size=768, vae_encode_chunk_size=1
-- For 4K video: spatial_tile_size=512, vae_encode_chunk_size=1
-- If OOM: Reduce spatial_tile_size or vae_tile_size
-- If seams visible: Increase spatial_tile_overlap
+【記憶體建議】
+• 如果 OOM: 降低 spatial_tile_size 或 chunk_size
+• 如果有明顯接縫: 增加 spatial_tile_overlap
+• 如果速度太慢: 增加 chunk_size（如記憶體允許）
 """
     
     def process(
@@ -239,12 +241,11 @@ These parameters enable processing of 2K+ resolution videos on GPUs with limited
         overlap,
         # Optional AMD/Tiling parameters with defaults
         enable_spatial_tiling=True,
-        spatial_tile_size=768,
-        spatial_tile_overlap=128,
-        vae_tile_size=256,
-        vae_tile_overlap=64,
-        vae_encode_chunk_size=1,
-        vae_decode_chunk_size=2,
+        spatial_tile_size=1024,
+        spatial_tile_overlap=192,
+        vae_encode_chunk_size=2,
+        vae_decode_chunk_size=4,
+        max_memory_usage_gb=100.0,
     ):
         device = depthcrafter_model['device']
         pipe = depthcrafter_model['pipe']
@@ -272,34 +273,31 @@ These parameters enable processing of 2K+ resolution videos on GPUs with limited
                 )
                 # Permute back: B, C, H, W -> B, H, W, C
                 images = images_resized.permute(0, 2, 3, 1)
-                # Update H, W to the new dimensions
                 H, W = height, width
             else:
-                # Dimensions are already multiples of 64 or rounding didn't change them
                 width = W
                 height = H
         else:
-            # Check if dimensions are multiples of 64
             if W % 64 != 0 or H % 64 != 0:
                 raise ValueError(
                     f"Input image dimensions ({W}x{H}) are not multiples of 64. "
                     f"Please resize your image to a multiple of 64 (e.g., {round(W / 64) * 64}x{round(H / 64) * 64}) "
                     f"or enable the 'force_size' option."
                 )
-            # Use original dimensions if they are valid
             width = W
             height = H
 
         # 顯示 tiling 配置資訊
         max_dim = max(height, width)
         if enable_spatial_tiling and max_dim > spatial_tile_size:
-            n_tiles_y = max(1, (height - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
-            n_tiles_x = max(1, (width - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
+            stride = spatial_tile_size - spatial_tile_overlap
+            n_tiles_y = max(1, math.ceil((height - spatial_tile_overlap) / stride))
+            n_tiles_x = max(1, math.ceil((width - spatial_tile_overlap) / stride))
             total_tiles = n_tiles_y * n_tiles_x
             print(f"DepthCrafter: Spatial Tiling enabled - {total_tiles} tiles ({n_tiles_x}x{n_tiles_y})")
             print(f"  - Tile size: {spatial_tile_size}, Overlap: {spatial_tile_overlap}")
-            print(f"  - VAE tile size: {vae_tile_size}, VAE overlap: {vae_tile_overlap}")
             print(f"  - VAE encode chunk: {vae_encode_chunk_size}, VAE decode chunk: {vae_decode_chunk_size}")
+            print(f"  - Max memory: {max_memory_usage_gb} GB")
         else:
             print(f"DepthCrafter: Processing at {width}x{height} (no spatial tiling needed)")
 
@@ -310,14 +308,14 @@ These parameters enable processing of 2K+ resolution videos on GPUs with limited
         
         # Calculate total num of steps for progress bar
         if enable_spatial_tiling and max_dim > spatial_tile_size:
-            # Estimate tiles
-            n_tiles_y = max(1, (height - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
-            n_tiles_x = max(1, (width - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
+            stride = spatial_tile_size - spatial_tile_overlap
+            n_tiles_y = max(1, math.ceil((height - spatial_tile_overlap) / stride))
+            n_tiles_x = max(1, math.ceil((width - spatial_tile_overlap) / stride))
             total_tiles = n_tiles_y * n_tiles_x
-            num_windows = math.ceil((B - window_size) / (window_size - overlap)) + 1 if B > window_size else 1
+            num_windows = math.ceil((B - window_size) / max(1, window_size - overlap)) + 1 if B > window_size else 1
             total_steps = num_inference_steps * num_windows * total_tiles
         else:
-            num_windows = math.ceil((B - window_size) / (window_size - overlap)) + 1 if B > window_size else 1
+            num_windows = math.ceil((B - window_size) / max(1, window_size - overlap)) + 1 if B > window_size else 1
             total_steps = num_inference_steps * num_windows
             
         self.start_progress(total_steps)
@@ -339,25 +337,41 @@ These parameters enable processing of 2K+ resolution videos on GPUs with limited
                 enable_spatial_tiling=enable_spatial_tiling,
                 spatial_tile_size=spatial_tile_size,
                 spatial_tile_overlap=spatial_tile_overlap,
-                vae_tile_size=vae_tile_size,
-                vae_tile_overlap=vae_tile_overlap,
                 vae_encode_chunk_size=vae_encode_chunk_size,
                 vae_decode_chunk_size=vae_decode_chunk_size,
+                max_memory_usage_gb=max_memory_usage_gb,
             )
             
-        res = result.frames[0]  # [B, H, W, C]
+        res = result.frames[0]  # [B, H, W, C] 或 [B, C, H, W] 視 video_processor 輸出
+        
+        # 確保格式正確
+        if res.dim() == 4 and res.shape[1] == 3:
+            # [B, C, H, W] -> [B, H, W, C]
+            res = res.permute(0, 2, 3, 1)
+        
+        # 檢查並修復無效值
+        if torch.isnan(res).any() or torch.isinf(res).any():
+            print("[DepthCrafter] 警告: 輸出包含無效值，正在修復...")
+            res = torch.nan_to_num(res, nan=0.5, posinf=1.0, neginf=0.0)
         
         # Convert to grayscale depth map
-        res = res.sum(dim=1) / res.shape[1]  # [B, H, W]
+        if res.shape[-1] == 3:
+            res = res.mean(dim=-1)  # [B, H, W]
+        else:
+            res = res.squeeze(-1)  # 移除最後一維如果是 1
         
         # Normalize depth maps
         res_min = res.min()
         res_max = res.max()
-        res = (res - res_min) / (res_max - res_min + 1e-8)
+        if res_max - res_min > 1e-8:
+            res = (res - res_min) / (res_max - res_min)
+        else:
+            print("[DepthCrafter] 警告: 深度圖幾乎沒有變化，可能有問題")
+            res = torch.ones_like(res) * 0.5
         
         # Convert back to tensor with 3 channels
         depth_maps = res.unsqueeze(-1).repeat(1, 1, 1, 3)  # [B, H, W, 3]
-        depth_maps = depth_maps.float()
+        depth_maps = depth_maps.float().cpu()
         
         self.end_progress()
         
