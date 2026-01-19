@@ -20,15 +20,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     """
     DepthCrafter Pipeline - AMD gfx1151 優化版本
     支援 2K+ 解析度原生處理 (Spatial Tiling)
-    
-    新增參數可透過 __call__ 傳入：
-    - enable_spatial_tiling: 是否啟用空間分塊
-    - spatial_tile_size: 空間分塊大小
-    - spatial_tile_overlap: 空間分塊重疊
-    - vae_tile_size: VAE 分塊大小
-    - vae_tile_overlap: VAE 分塊重疊
-    - vae_encode_chunk_size: VAE encoding 每批幀數
-    - vae_decode_chunk_size: VAE decoding 每批幀數
     """
     
     @classmethod
@@ -48,23 +39,29 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         except Exception as e:
             print(f"[AMD] 警告: {e}")
 
-    def _enable_vae_tiling(self, vae_tile_size: int = 256, vae_tile_overlap: int = 64):
-        """啟用 VAE tiling"""
+    def _try_enable_vae_tiling(self, vae_tile_size: int = 256, vae_tile_overlap: int = 64):
+        """嘗試啟用 VAE tiling（如果支援）"""
         try:
-            self.vae.enable_tiling()
-            if hasattr(self.vae, 'tile_sample_min_size'):
-                self.vae.tile_sample_min_size = vae_tile_size
-            if hasattr(self.vae, 'tile_latent_min_size'):
-                self.vae.tile_latent_min_size = vae_tile_size // 8
-            if hasattr(self.vae, 'tile_overlap_factor'):
-                self.vae.tile_overlap_factor = vae_tile_overlap / vae_tile_size
+            # 檢查 VAE 類型是否支援 tiling
+            if hasattr(self.vae, 'enable_tiling'):
+                self.vae.enable_tiling()
+                if hasattr(self.vae, 'tile_sample_min_size'):
+                    self.vae.tile_sample_min_size = vae_tile_size
+                if hasattr(self.vae, 'tile_latent_min_size'):
+                    self.vae.tile_latent_min_size = vae_tile_size // 8
+                if hasattr(self.vae, 'tile_overlap_factor'):
+                    self.vae.tile_overlap_factor = vae_tile_overlap / vae_tile_size
+                return True
         except Exception as e:
-            print(f"[VAE Tiling] 警告: {e}")
+            # AutoencoderKLTemporalDecoder 不支援 tiling，這是預期的
+            pass
+        return False
 
-    def _disable_vae_tiling(self):
-        """停用 VAE tiling"""
+    def _try_disable_vae_tiling(self):
+        """嘗試停用 VAE tiling"""
         try:
-            self.vae.disable_tiling()
+            if hasattr(self.vae, 'disable_tiling'):
+                self.vae.disable_tiling()
         except:
             pass
 
@@ -74,19 +71,8 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         width: int, 
         tile_size: int, 
         tile_overlap: int
-    ) -> List[Dict]:
-        """
-        計算空間分塊的座標
-        
-        Args:
-            height: 影片高度
-            width: 影片寬度
-            tile_size: 分塊大小
-            tile_overlap: 分塊重疊
-        
-        Returns:
-            List of dicts with tile coordinates and padding info
-        """
+    ) -> tuple:
+        """計算空間分塊的座標"""
         stride = tile_size - tile_overlap
         
         tiles = []
@@ -106,7 +92,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 actual_h = y_end - y_start
                 actual_w = x_end - x_start
                 
-                # 計算需要的 padding 使其成為 64 的倍數
                 target_h = ((actual_h + 63) // 64) * 64
                 target_w = ((actual_w + 63) // 64) * 64
                 
@@ -140,28 +125,21 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         is_right: bool,
         overlap: int
     ) -> torch.Tensor:
-        """
-        創建用於混合 tiles 的漸變遮罩
-        在重疊區域使用線性漸變，確保無縫拼接
-        """
+        """創建用於混合 tiles 的漸變遮罩"""
         mask = torch.ones(tile_h, tile_w)
         
-        # 上邊漸變
         if not is_top and overlap > 0:
             for i in range(min(overlap, tile_h)):
                 mask[i, :] *= i / overlap
         
-        # 下邊漸變
         if not is_bottom and overlap > 0:
             for i in range(min(overlap, tile_h)):
                 mask[tile_h - 1 - i, :] *= i / overlap
         
-        # 左邊漸變
         if not is_left and overlap > 0:
             for i in range(min(overlap, tile_w)):
                 mask[:, i] *= i / overlap
         
-        # 右邊漸變
         if not is_right and overlap > 0:
             for i in range(min(overlap, tile_w)):
                 mask[:, tile_w - 1 - i] *= i / overlap
@@ -194,25 +172,81 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         return torch.cat(embeddings, dim=0)
 
     @torch.inference_mode()
-    def encode_vae_video_tiled(
+    def encode_vae_video_chunked(
         self,
         video: torch.Tensor,
         chunk_size: int = 1,
-        vae_tile_size: int = 256,
-        vae_tile_overlap: int = 64,
     ):
-        """使用 tiling 編碼影片"""
-        self._enable_vae_tiling(vae_tile_size, vae_tile_overlap)
-        
+        """
+        分塊編碼影片為 VAE latents
+        由於 AutoencoderKLTemporalDecoder 不支援 tiling，
+        我們使用小的 chunk_size 來減少記憶體使用
+        """
         video_latents = []
-        for i in range(0, video.shape[0], chunk_size):
+        total_frames = video.shape[0]
+        
+        for i in range(0, total_frames, chunk_size):
             torch.cuda.empty_cache()
             chunk = video[i : i + chunk_size]
+            
+            # VAE encode
             latent = self.vae.encode(chunk).latent_dist.mode()
             video_latents.append(latent)
-        
-        self._disable_vae_tiling()
+            
         return torch.cat(video_latents, dim=0)
+
+    def _decode_latents_chunked(
+        self,
+        latents: torch.Tensor,
+        num_frames: int,
+        decode_chunk_size: int = 2,
+    ) -> torch.Tensor:
+        """
+        分塊解碼 latents 為影片幀
+        並確保輸出形狀為 [B, F, C, H, W]
+        
+        Args:
+            latents: [B, F, C, H, W] 格式的 latents
+            num_frames: 幀數
+            decode_chunk_size: 每批解碼的幀數
+        
+        Returns:
+            frames: [B, F, C, H, W] 格式的影片幀
+        """
+        # latents shape: [B, F, C, H, W]
+        latents = 1 / self.vae.config.scaling_factor * latents
+        
+        batch_size = latents.shape[0]
+        
+        # Flatten: [B, F, C, H, W] -> [B*F, C, H, W]
+        latents_flat = latents.reshape(-1, *latents.shape[2:])
+        
+        # Decode in chunks
+        decoded_frames = []
+        for i in range(0, latents_flat.shape[0], decode_chunk_size):
+            torch.cuda.empty_cache()
+            chunk = latents_flat[i : i + decode_chunk_size]
+            num_frames_in_chunk = chunk.shape[0]
+            
+            # AutoencoderKLTemporalDecoder 需要 num_frames 參數
+            try:
+                decoded = self.vae.decode(chunk, num_frames=num_frames_in_chunk).sample
+            except TypeError:
+                # 如果不支援 num_frames 參數
+                decoded = self.vae.decode(chunk).sample
+            
+            decoded_frames.append(decoded)
+        
+        # Concatenate: [total_frames, C, H, W]
+        frames = torch.cat(decoded_frames, dim=0)
+        
+        # Reshape back to [B, F, C, H, W]
+        frames = frames.reshape(batch_size, num_frames, *frames.shape[1:])
+        
+        # Normalize to [0, 1]
+        frames = (frames / 2 + 0.5).clamp(0, 1)
+        
+        return frames
 
     def _process_single_tile(
         self,
@@ -232,20 +266,25 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     ) -> torch.Tensor:
         """
         處理單一空間 tile
-        這是核心處理函數，與原始 DepthCrafter 邏輯相同
+        
+        Returns:
+            frames: [1, T, C, H, W] 格式的深度圖
         """
         num_frames = video_tile.shape[0]
         height, width = video_tile.shape[2], video_tile.shape[3]
         
         if num_frames <= window_size:
-            window_size = num_frames
-            overlap = 0
-        stride = window_size - overlap
+            actual_window_size = num_frames
+            actual_overlap = 0
+        else:
+            actual_window_size = window_size
+            actual_overlap = overlap
+        stride = actual_window_size - actual_overlap
         
         # CLIP encoding
         video_embeddings = self.encode_video(
             video_tile, chunk_size=4
-        ).unsqueeze(0)
+        ).unsqueeze(0)  # [1, T, 1024]
         
         torch.cuda.empty_cache()
         
@@ -255,17 +294,15 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         )
         video_noised = video_tile + noise_aug_strength * noise
         
-        # VAE encoding
+        # VAE encoding (使用分塊方式)
         needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
         if needs_upcasting:
             self.vae.to(dtype=torch.float32)
         
-        video_latents = self.encode_vae_video_tiled(
+        video_latents = self.encode_vae_video_chunked(
             video_noised.to(self.vae.dtype),
             chunk_size=vae_encode_chunk_size,
-            vae_tile_size=vae_tile_size,
-            vae_tile_overlap=vae_tile_overlap,
-        ).unsqueeze(0)
+        ).unsqueeze(0)  # [1, T, C, H/8, W/8]
         
         torch.cuda.empty_cache()
         
@@ -279,45 +316,49 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         ).to(device)
         
         # Timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(
+        timesteps, num_inference_steps_actual = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, None, None
         )
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - num_inference_steps_actual * self.scheduler.order
         
         # Prepare latents
         num_channels_latents = self.unet.config.in_channels
         latents_init = self.prepare_latents(
-            1, window_size, num_channels_latents,
+            1, actual_window_size, num_channels_latents,
             height, width, video_embeddings.dtype, device,
             generator, None,
-        )
+        )  # [1, window_size, C, H/8, W/8]
+        
         latents_all = None
         
         idx_start = 0
-        if overlap > 0:
-            weights = torch.linspace(0, 1, overlap, device=device).view(1, overlap, 1, 1, 1)
+        if actual_overlap > 0:
+            weights = torch.linspace(0, 1, actual_overlap, device=device).view(1, actual_overlap, 1, 1, 1)
         else:
             weights = None
         
-        # Denoising loop
-        while idx_start < num_frames - max(overlap, 0):
-            idx_end = min(idx_start + window_size, num_frames)
+        # Denoising loop with temporal sliding window
+        while idx_start < num_frames - max(actual_overlap, 0):
+            idx_end = min(idx_start + actual_window_size, num_frames)
+            current_len = idx_end - idx_start
+            
             self.scheduler.set_timesteps(num_inference_steps, device=device)
             
-            latents = latents_init[:, :idx_end - idx_start].clone()
-            if overlap > 0:
+            latents = latents_init[:, :current_len].clone()
+            
+            if actual_overlap > 0 and idx_start > 0:
                 latents_init = torch.cat(
-                    [latents_init[:, -overlap:], latents_init[:, :stride]], dim=1
+                    [latents_init[:, -actual_overlap:], latents_init[:, :stride]], dim=1
                 )
             
             video_latents_current = video_latents[:, idx_start:idx_end]
             video_embeddings_current = video_embeddings[:, idx_start:idx_end]
             
             for i, t in enumerate(timesteps):
-                if latents_all is not None and i == 0 and overlap > 0:
-                    latents[:, :overlap] = (
-                        latents_all[:, -overlap:]
-                        + latents[:, :overlap] / self.scheduler.init_noise_sigma
+                if latents_all is not None and i == 0 and actual_overlap > 0:
+                    latents[:, :actual_overlap] = (
+                        latents_all[:, -actual_overlap:]
+                        + latents[:, :actual_overlap] / self.scheduler.init_noise_sigma
                         * self.scheduler.sigmas[i]
                     )
                 
@@ -334,12 +375,12 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 )[0]
                 
                 if self.do_classifier_free_guidance:
-                    latent_model_input = self.scheduler.scale_model_input(latents, t)
-                    latent_model_input = torch.cat(
-                        [latent_model_input, torch.zeros_like(latent_model_input)], dim=2
+                    latent_model_input_uncond = self.scheduler.scale_model_input(latents, t)
+                    latent_model_input_uncond = torch.cat(
+                        [latent_model_input_uncond, torch.zeros_like(latent_model_input_uncond)], dim=2
                     )
                     noise_pred_uncond = self.unet(
-                        latent_model_input, t,
+                        latent_model_input_uncond, t,
                         encoder_hidden_states=torch.zeros_like(video_embeddings_current),
                         added_time_ids=added_time_ids,
                         return_dict=False,
@@ -348,30 +389,36 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 
                 latents = self.scheduler.step(noise_pred, t, latents).prev_sample
                 
-                # Progress callback
                 if progress_callback is not None:
                     progress_callback(i)
             
+            # 合併 latents
             if latents_all is None:
                 latents_all = latents.clone()
             else:
-                if weights is not None and overlap > 0:
-                    latents_all[:, -overlap:] = (
-                        latents[:, :overlap] * weights 
-                        + latents_all[:, -overlap:] * (1 - weights)
+                if weights is not None and actual_overlap > 0:
+                    # 混合重疊區域
+                    blend_weights = weights[:, :min(actual_overlap, latents.shape[1])]
+                    latents_all[:, -actual_overlap:] = (
+                        latents[:, :actual_overlap] * blend_weights 
+                        + latents_all[:, -actual_overlap:] * (1 - blend_weights)
                     )
-                latents_all = torch.cat([latents_all, latents[:, overlap:]], dim=1)
+                if current_len > actual_overlap:
+                    latents_all = torch.cat([latents_all, latents[:, actual_overlap:]], dim=1)
             
             idx_start += stride
             torch.cuda.empty_cache()
         
-        # VAE decode
-        self._enable_vae_tiling(vae_tile_size, vae_tile_overlap)
+        # VAE decode (使用自定義分塊解碼)
         latents_all = latents_all.to(dtype=self.vae.dtype)
-        frames = self.decode_latents(latents_all, num_frames, vae_decode_chunk_size)
-        self._disable_vae_tiling()
         
-        return frames  # [1, T, C, H, W]
+        frames = self._decode_latents_chunked(
+            latents_all, 
+            num_frames, 
+            vae_decode_chunk_size
+        )  # [1, T, C, H, W]
+        
+        return frames
 
     @staticmethod
     def check_inputs(video, height, width):
@@ -410,25 +457,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     ):
         """
         DepthCrafter Pipeline - 支援 2K+ 原生解析度
-        使用 Spatial Tiling 技術分塊處理
-        
-        Args:
-            video: 輸入影片 [T, H, W, C] (np.ndarray) 或 [T, C, H, W] (torch.Tensor)
-            height: 目標高度
-            width: 目標寬度
-            num_inference_steps: 去噪步數
-            guidance_scale: CFG scale
-            window_size: 時間滑動窗口大小
-            overlap: 時間窗口重疊
-            ...
-            
-            enable_spatial_tiling: 是否啟用空間分塊 (2K+ 必須)
-            spatial_tile_size: 空間分塊大小 (像素，必須是 64 的倍數)
-            spatial_tile_overlap: 空間分塊重疊 (像素)
-            vae_tile_size: VAE 分塊大小
-            vae_tile_overlap: VAE 分塊重疊
-            vae_encode_chunk_size: VAE encoding 每批幀數
-            vae_decode_chunk_size: VAE decoding 每批幀數
         """
         
         # AMD 優化設定
@@ -468,16 +496,13 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         print(f"  - enable_spatial_tiling: {enable_spatial_tiling}")
         print(f"  - spatial_tile_size: {spatial_tile_size}")
         print(f"  - spatial_tile_overlap: {spatial_tile_overlap}")
-        print(f"  - vae_tile_size: {vae_tile_size}")
         print(f"  - vae_encode_chunk_size: {vae_encode_chunk_size}")
         print(f"  - vae_decode_chunk_size: {vae_decode_chunk_size}")
         
         # ==================== Spatial Tiling ====================
-        # 判斷是否需要 tiling
         needs_tiling = enable_spatial_tiling and (height > spatial_tile_size or width > spatial_tile_size)
         
         if not needs_tiling:
-            # 不需要 spatial tiling，直接處理
             print(f"[DepthCrafter] 解析度較小或已停用 tiling，直接處理")
             frames = self._process_single_tile(
                 video, 
@@ -495,13 +520,12 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 progress_callback,
             )
         else:
-            # 需要 spatial tiling
             tiles, n_tiles_y, n_tiles_x = self._calculate_tiles(
                 height, width, spatial_tile_size, spatial_tile_overlap
             )
             print(f"[DepthCrafter] 使用 Spatial Tiling: {len(tiles)} tiles ({n_tiles_x}x{n_tiles_y})")
             
-            # 準備輸出 buffer 和 weight buffer
+            # 準備輸出 buffer: [1, F, C, H, W]
             output_buffer = torch.zeros(
                 (1, num_frames, 3, height, width), 
                 device=device, dtype=self.dtype
@@ -523,10 +547,10 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 x_start = tile_info['x_start']
                 x_end = tile_info['x_end']
                 
-                # 提取 tile
-                video_tile = video[:, :, y_start:y_end, x_start:x_end]
+                # 提取 tile: [T, C, H, W]
+                video_tile = video[:, :, y_start:y_end, x_start:x_end].clone()
                 
-                # Padding 到目標尺寸 (64 的倍數)
+                # Padding 到 64 的倍數
                 if tile_info['pad_bottom'] > 0 or tile_info['pad_right'] > 0:
                     video_tile = F.pad(
                         video_tile, 
@@ -536,7 +560,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 
                 torch.cuda.empty_cache()
                 
-                # 處理 tile
+                # 處理 tile -> [1, T, C, tile_H, tile_W]
                 tile_result = self._process_single_tile(
                     video_tile, 
                     num_inference_steps, 
@@ -553,7 +577,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                     progress_callback,
                 )
                 
-                # 移除 padding
+                # 移除 padding: tile_result 形狀 [1, T, C, H, W]
                 actual_h = y_end - y_start
                 actual_w = x_end - x_start
                 tile_result = tile_result[:, :, :, :actual_h, :actual_w]
@@ -570,20 +594,31 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                     spatial_tile_overlap
                 ).to(device=device, dtype=self.dtype)
                 
+                # 擴展 blend_mask 為 [1, 1, 1, H, W] 以便廣播
                 blend_mask = blend_mask.view(1, 1, 1, actual_h, actual_w)
                 
                 # 累加到 buffer
                 output_buffer[:, :, :, y_start:y_end, x_start:x_end] += tile_result * blend_mask
                 weight_buffer[:, :, :, y_start:y_end, x_start:x_end] += blend_mask
                 
+                # 清理 tile 記憶體
+                del video_tile, tile_result, blend_mask
                 torch.cuda.empty_cache()
             
             # 正規化
             frames = output_buffer / (weight_buffer + 1e-8)
+            
+            # 清理 buffer
+            del output_buffer, weight_buffer
+            torch.cuda.empty_cache()
+        
         # ========================================================
         
         # 後處理
         if output_type != "latent":
+            # frames 目前是 [1, F, C, H, W]
+            # video_processor.postprocess_video 預期 [B, F, C, H, W]
+            # 輸出會是 [B, F, H, W, C] (當 output_type="pt")
             frames = self.video_processor.postprocess_video(
                 video=frames, output_type=output_type
             )
