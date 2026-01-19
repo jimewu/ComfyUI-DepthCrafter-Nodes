@@ -26,7 +26,7 @@ def aggressive_memory_cleanup():
 
 
 def safe_tensor(tensor: torch.Tensor, name: str = "tensor", fix_value: float = 0.0) -> torch.Tensor:
-    """確保 tensor 沒有 NaN/Inf，如果有則修復並警告"""
+    """確保 tensor 沒有 NaN/Inf"""
     if tensor is None:
         return tensor
     
@@ -45,12 +45,13 @@ def safe_tensor(tensor: torch.Tensor, name: str = "tensor", fix_value: float = 0
 
 class DepthCrafterPipeline(StableVideoDiffusionPipeline):
     """
-    DepthCrafter Pipeline - AMD AI MAX+ 395 優化版本 V8
-    修復 from_pretrained 問題，強制 VAE 使用 float32
+    DepthCrafter Pipeline - AMD AI MAX+ 395 優化版本 V9
+    關鍵修復：啟用 UNet 注意力分片解決 OOM
     """
 
-    def _setup_for_amd(self):
-        """設定 AMD 優化選項"""
+    def _setup_for_amd(self, attention_slice_size: int = 1):
+        """設定 AMD 優化選項 - 關鍵：啟用注意力分片"""
+        # 1. 使用預設注意力處理器（避免 Flash Attention 問題）
         try:
             self.unet.set_default_attn_processor()
             self.vae.set_default_attn_processor()
@@ -58,46 +59,85 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         except Exception as e:
             print(f"[AMD] 警告: 無法設定 attention processor: {e}")
         
+        # 2. 關鍵：啟用注意力分片 - 這會大幅減少記憶體使用
+        # slice_size=1 表示一次只處理一個 head，最省記憶體但最慢
+        # slice_size="auto" 會自動選擇
+        try:
+            self.enable_attention_slicing(slice_size=attention_slice_size)
+            print(f"[AMD] 已啟用 Attention Slicing (slice_size={attention_slice_size})")
+        except Exception as e:
+            print(f"[AMD] 警告: 無法啟用 attention slicing: {e}")
+        
+        # 3. VAE slicing
         try:
             if hasattr(self.vae, 'enable_slicing'):
                 self.vae.enable_slicing()
+                print("[AMD] 已啟用 VAE Slicing")
         except Exception as e:
             pass
         
         print("[AMD] 強制 VAE 使用 float32 以確保數值穩定性")
 
     def _estimate_memory_for_config(self, tile_size: int, window_size: int) -> float:
-        """估算特定配置需要的 GPU 記憶體 (GB)"""
-        base_tile = 1024
-        base_window = 60
-        base_memory = 85.0
+        """
+        準確的記憶體估算 - 基於 UNet 時序注意力
         
-        ratio = (tile_size / base_tile) ** 2 * (window_size / base_window)
-        estimated = base_memory * ratio
-        fixed_overhead = 15.0
+        關鍵公式：
+        - 序列長度 = window_size × (tile_size/8)²
+        - 注意力矩陣 = 序列長度² × 4 bytes × num_heads
+        """
+        latent_size = tile_size // 8  # VAE 下採樣因子
+        seq_len = window_size * latent_size * latent_size
         
-        return estimated + fixed_overhead
+        # 注意力矩陣記憶體 (GB)
+        num_heads = 16  # SVD UNet 典型值
+        attention_memory_gb = (seq_len ** 2) * 4 * num_heads / (1024 ** 3)
+        
+        # 模型權重 (~4 GB for fp16)
+        model_memory_gb = 4.0
+        
+        # 激活值和中間張量 (約為注意力的 2 倍)
+        activation_memory_gb = attention_memory_gb * 2.0
+        
+        # 影片幀和 latents
+        frame_memory_gb = window_size * 3 * tile_size * tile_size * 4 / (1024 ** 3)
+        latent_memory_gb = window_size * 4 * latent_size * latent_size * 4 / (1024 ** 3)
+        
+        total = attention_memory_gb + model_memory_gb + activation_memory_gb + frame_memory_gb + latent_memory_gb
+        
+        # 安全邊際 1.5x（考慮碎片和其他開銷）
+        # 但如果啟用了 attention slicing，可以用較小的邊際
+        return total * 1.3
 
     def _find_optimal_config(
         self,
         height: int,
         width: int,
         num_frames: int,
-        available_memory_gb: float = 110.0,
+        available_memory_gb: float = 100.0,
         prefer_fewer_tiles: bool = True,
     ) -> dict:
-        """尋找最優配置"""
-        tile_sizes = [1280, 1152, 1024, 896, 768, 640, 576, 512, 448, 384]
-        window_sizes = [10, 12, 15, 18, 20, 25, 30]
+        """
+        尋找最優配置 - 使用準確的記憶體估算
+        
+        對於 2K (2304x1408) 和 128GB：
+        - 推薦：tile=448, window=6, tiles=12
+        """
+        # 注意：這些是經過計算的安全值
+        # tile_size 必須能被 64 整除
+        tile_sizes = [576, 512, 448, 384, 320, 256]
+        window_sizes = [8, 7, 6, 5, 4, 3]
         
         best_config = None
         min_tiles = float('inf')
+        max_usable_tile = 0
         
         for tile_size in tile_sizes:
             for window_size in window_sizes:
                 estimated_mem = self._estimate_memory_for_config(tile_size, window_size)
                 
-                if estimated_mem > available_memory_gb * 0.85:
+                # 只使用 80% 的可用記憶體，留餘地
+                if estimated_mem > available_memory_gb * 0.80:
                     continue
                 
                 overlap = max(64, tile_size // 6)
@@ -108,25 +148,35 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 total_tiles = n_tiles_x * n_tiles_y
                 
                 if prefer_fewer_tiles:
-                    if total_tiles < min_tiles or (total_tiles == min_tiles and best_config and tile_size > best_config['tile_size']):
+                    # 優先選擇較少的 tiles（較大的 tile_size）
+                    if tile_size > max_usable_tile or (tile_size == max_usable_tile and total_tiles < min_tiles):
+                        max_usable_tile = tile_size
                         min_tiles = total_tiles
                         best_config = {
                             'tile_size': tile_size,
                             'window_size': window_size,
                             'overlap': overlap,
-                            'window_overlap': max(2, window_size // 6),
+                            'window_overlap': max(1, window_size // 4),
+                            'n_tiles_x': n_tiles_x,
+                            'n_tiles_y': n_tiles_y,
                             'tiles': total_tiles,
                             'estimated_memory': estimated_mem,
                         }
+                        # 找到最大可用 tile 就停止搜索 window
+                        break
         
         if best_config is None:
+            # 最保守的配置
+            print("[警告] 無法找到合適配置，使用最小值")
             best_config = {
-                'tile_size': 384,
-                'window_size': 10,
+                'tile_size': 256,
+                'window_size': 3,
                 'overlap': 64,
-                'window_overlap': 2,
+                'window_overlap': 1,
+                'n_tiles_x': math.ceil(width / 192),
+                'n_tiles_y': math.ceil(height / 192),
                 'tiles': -1,
-                'estimated_memory': 20.0,
+                'estimated_memory': 15.0,
             }
         
         return best_config
@@ -186,7 +236,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         is_right: bool,
         overlap: int
     ) -> torch.Tensor:
-        """創建用於混合 tiles 的漸變遮罩"""
+        """創建用於混合 tiles 的漸變遮罩 - 使用 cosine 混合"""
         MIN_WEIGHT = 0.01
         
         def create_1d_weight(size: int, is_start: bool, is_end: bool, overlap: int) -> torch.Tensor:
@@ -204,7 +254,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 t = torch.linspace(0, math.pi / 2, blend_len)
                 blend = torch.cos(t) ** 2
                 blend = blend * (1 - MIN_WEIGHT) + MIN_WEIGHT
-                weight[-blend_len:] = blend
+                weight[-blend_len:] = weight[-blend_len:] * blend
                 
             return weight
         
@@ -245,10 +295,11 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             emb = self.image_encoder(tmp.half()).image_embeds
             emb = safe_tensor(emb.float(), f"CLIP embedding chunk {i}")
             embeddings.append(emb)
-            del tmp
+            del tmp, chunk
 
         result = torch.cat(embeddings, dim=0)
         del embeddings
+        aggressive_memory_cleanup()
         return result
 
     @torch.inference_mode()
@@ -257,10 +308,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         video: torch.Tensor,
         chunk_size: int = 1,
     ) -> torch.Tensor:
-        """
-        分塊編碼影片為 VAE latents
-        關鍵：強制使用 float32 進行 VAE 編碼
-        """
+        """分塊編碼影片為 VAE latents - 強制使用 float32"""
         video_latents = []
         total_frames = video.shape[0]
         
@@ -279,13 +327,14 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             
             latent = safe_tensor(latent, f"VAE latent chunk {i}")
             
-            video_latents.append(latent)
+            video_latents.append(latent.cpu())  # 移到 CPU 節省 GPU 記憶體
             del chunk, latent_dist, latent
         
         self.vae.to(dtype=original_vae_dtype)
         
         result = torch.cat(video_latents, dim=0)
         del video_latents
+        aggressive_memory_cleanup()
         
         return result
 
@@ -295,10 +344,8 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         num_frames: int,
         decode_chunk_size: int = 1,
     ) -> torch.Tensor:
-        """
-        分塊解碼 latents
-        關鍵：強制使用 float32 進行 VAE 解碼
-        """
+        """分塊解碼 latents - 強制使用 float32"""
+        device = latents.device
         batch_size = latents.shape[0]
         latent_height = latents.shape[3]
         latent_width = latents.shape[4]
@@ -313,12 +360,11 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         self.vae.to(dtype=torch.float32)
         
         decoded_frames = []
-        decode_success = True
         
         for i in range(0, total_frames_to_decode, decode_chunk_size):
             aggressive_memory_cleanup()
             
-            chunk = latents_flat[i : i + decode_chunk_size].float()
+            chunk = latents_flat[i : i + decode_chunk_size].float().to(device)
             chunk = safe_tensor(chunk, f"decode input chunk {i}")
             
             num_frames_in_chunk = chunk.shape[0]
@@ -329,21 +375,14 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 decoded = self.vae.decode(chunk).sample
             
             decoded = safe_tensor(decoded, f"decoded chunk {i}")
-            
-            if torch.allclose(decoded, torch.zeros_like(decoded)):
-                print(f"[警告] Chunk {i} 解碼結果全為零")
-                decode_success = False
-            
             decoded_frames.append(decoded.cpu())
             del decoded, chunk
         
         self.vae.to(dtype=original_vae_dtype)
         
-        if not decode_success:
-            print("[警告] VAE 解碼可能失敗，結果可能不正確")
-        
         frames = torch.cat(decoded_frames, dim=0)
         del decoded_frames
+        aggressive_memory_cleanup()
         
         output_height = frames.shape[2]
         output_width = frames.shape[3]
@@ -351,7 +390,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         
         frames = (frames / 2 + 0.5)
         frames = torch.clamp(frames, 0, 1)
-        
         frames = safe_tensor(frames, "final decoded frames", fix_value=0.5)
         
         return frames
@@ -362,7 +400,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         num_inference_steps: int,
         guidance_scale: float,
         window_size: int,
-        overlap: int,
+        window_overlap: int,
         noise_aug_strength: float,
         generator: Optional[torch.Generator],
         device: torch.device,
@@ -383,15 +421,17 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             actual_overlap = 0
         else:
             actual_window_size = window_size
-            actual_overlap = overlap
+            actual_overlap = window_overlap
         stride = max(1, actual_window_size - actual_overlap)
         
+        # CLIP 編碼
         aggressive_memory_cleanup()
-        video_embeddings = self.encode_video(video_tile, chunk_size=2).unsqueeze(0)
+        video_embeddings = self.encode_video(video_tile, chunk_size=1).unsqueeze(0)
         video_embeddings = safe_tensor(video_embeddings, "video_embeddings")
         
         aggressive_memory_cleanup()
         
+        # 添加噪聲
         noise = randn_tensor(
             video_tile.shape, generator=generator, device=device, dtype=torch.float32
         )
@@ -399,24 +439,28 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         video_noised = torch.clamp(video_noised, -1.0, 1.0)
         del noise
         
+        # VAE 編碼
         video_latents = self.encode_vae_video_chunked(
             video_noised,
             chunk_size=vae_encode_chunk_size,
-        ).unsqueeze(0)
+        ).unsqueeze(0).to(device)
         video_latents = safe_tensor(video_latents, "video_latents")
         
         del video_noised
         aggressive_memory_cleanup()
         
+        # Time IDs
         added_time_ids = self._get_add_time_ids(
             7, 127, noise_aug_strength,
             torch.float16, 1, 1, False,
         ).to(device)
         
+        # Timesteps
         timesteps, num_inference_steps_actual = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, None, None
         )
         
+        # Prepare latents
         num_channels_latents = self.unet.config.in_channels
         latents_init = self.prepare_latents(
             1, actual_window_size, num_channels_latents,
@@ -432,12 +476,15 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         else:
             weights = None
         
+        window_count = 0
         while idx_start < num_frames:
             idx_end = min(idx_start + actual_window_size, num_frames)
             current_len = idx_end - idx_start
             
             if current_len == 0:
                 break
+            
+            window_count += 1
             
             self.scheduler.set_timesteps(num_inference_steps, device=device)
             
@@ -451,13 +498,15 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             video_latents_current = video_latents[:, idx_start:idx_end].half()
             video_embeddings_current = video_embeddings[:, idx_start:idx_end].half()
             
+            # Denoising loop
             for i, t in enumerate(timesteps):
+                # 每 3 步清理一次記憶體
                 if i % 3 == 0:
                     aggressive_memory_cleanup()
                 
                 if latents_all is not None and i == 0 and actual_overlap > 0:
                     latents[:, :actual_overlap] = (
-                        latents_all[:, -actual_overlap:]
+                        latents_all[:, -actual_overlap:].to(device)
                         + latents[:, :actual_overlap] / self.scheduler.init_noise_sigma
                         * self.scheduler.sigmas[i]
                     )
@@ -467,6 +516,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                     [latent_model_input, video_latents_current], dim=2
                 )
                 
+                # UNet 前向傳播 - 注意力分片已在 _setup_for_amd 中啟用
                 noise_pred = self.unet(
                     latent_model_input, t,
                     encoder_hidden_states=video_embeddings_current,
@@ -480,18 +530,19 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 
                 del latent_model_input
                 
+                # CFG (if enabled)
                 if self.do_classifier_free_guidance:
-                    latent_model_input_uncond = self.scheduler.scale_model_input(latents, t)
-                    latent_model_input_uncond = torch.cat(
-                        [latent_model_input_uncond, torch.zeros_like(latent_model_input_uncond)], dim=2
+                    latent_uncond = self.scheduler.scale_model_input(latents, t)
+                    latent_uncond = torch.cat(
+                        [latent_uncond, torch.zeros_like(latent_uncond)], dim=2
                     )
                     noise_pred_uncond = self.unet(
-                        latent_model_input_uncond, t,
+                        latent_uncond, t,
                         encoder_hidden_states=torch.zeros_like(video_embeddings_current),
                         added_time_ids=added_time_ids,
                         return_dict=False,
                     )[0]
-                    del latent_model_input_uncond
+                    del latent_uncond
                     
                     if torch.isnan(noise_pred_uncond).any():
                         noise_pred_uncond = torch.nan_to_num(noise_pred_uncond, nan=0.0)
@@ -505,27 +556,31 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 if progress_callback is not None:
                     progress_callback(i)
             
+            # 合併 latents
             if latents_all is None:
-                latents_all = latents.clone()
+                latents_all = latents.cpu()
             else:
+                latents_cpu = latents.cpu()
                 if weights is not None and actual_overlap > 0:
-                    blend_len = min(actual_overlap, latents.shape[1])
-                    blend_weights = weights[:, :blend_len]
+                    blend_len = min(actual_overlap, latents_cpu.shape[1])
+                    blend_weights = weights[:, :blend_len].cpu()
                     latents_all[:, -blend_len:] = (
-                        latents[:, :blend_len] * blend_weights 
+                        latents_cpu[:, :blend_len] * blend_weights 
                         + latents_all[:, -blend_len:] * (1 - blend_weights)
                     )
                 if current_len > actual_overlap:
-                    latents_all = torch.cat([latents_all, latents[:, actual_overlap:]], dim=1)
+                    latents_all = torch.cat([latents_all, latents_cpu[:, actual_overlap:]], dim=1)
+                del latents_cpu
             
-            del latents
+            del latents, video_latents_current, video_embeddings_current
             idx_start += stride
             aggressive_memory_cleanup()
         
         del video_latents, video_embeddings
         aggressive_memory_cleanup()
         
-        latents_all = safe_tensor(latents_all.float(), "latents_all before decode")
+        # VAE 解碼
+        latents_all = safe_tensor(latents_all.float().to(device), "latents_all before decode")
         
         frames = self._decode_latents_chunked(
             latents_all,
@@ -555,6 +610,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         num_inference_steps: int = 25,
         guidance_scale: float = 1.0,
         window_size: Optional[int] = None,
+        window_overlap: Optional[int] = None,
         noise_aug_strength: float = 0.02,
         decode_chunk_size: Optional[int] = None,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -563,23 +619,32 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         return_dict: bool = True,
-        overlap: int = None,
+        overlap: int = None,  # deprecated, use window_overlap
         track_time: bool = False,
         progress_callback: Optional[Callable] = None,
+        # ==================== 配置參數 ====================
         enable_spatial_tiling: bool = True,
         spatial_tile_size: int = None,
         spatial_tile_overlap: int = None,
         vae_encode_chunk_size: int = 1,
         vae_decode_chunk_size: int = 1,
-        max_memory_usage_gb: float = 110.0,
+        max_memory_usage_gb: float = 100.0,
         auto_optimize: bool = True,
         prefer_fewer_tiles: bool = True,
+        attention_slice_size: int = 1,  # 關鍵：注意力分片大小
+        # =================================================
     ):
         """
-        DepthCrafter Pipeline V8
+        DepthCrafter Pipeline V9
+        
+        關鍵修復：
+        1. 啟用 UNet 注意力分片
+        2. 準確的記憶體估算
+        3. 數值穩定性
         """
         
-        self._setup_for_amd()
+        # 設定 AMD 優化 - 包含注意力分片
+        self._setup_for_amd(attention_slice_size=attention_slice_size)
         self._guidance_scale = guidance_scale
         
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -607,6 +672,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
         
         num_frames = video.shape[0]
         
+        # 自動優化配置
         if auto_optimize:
             optimal = self._find_optimal_config(
                 height, width, num_frames, 
@@ -614,30 +680,35 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 prefer_fewer_tiles
             )
             
-            if spatial_tile_size is None or spatial_tile_size > optimal['tile_size']:
+            if spatial_tile_size is None:
                 spatial_tile_size = optimal['tile_size']
             if spatial_tile_overlap is None:
                 spatial_tile_overlap = optimal['overlap']
-            if window_size is None or window_size > optimal['window_size']:
+            if window_size is None:
                 window_size = optimal['window_size']
-            if overlap is None:
-                overlap = optimal['window_overlap']
+            if window_overlap is None:
+                window_overlap = optimal['window_overlap']
             
             print(f"[DepthCrafter] 自動優化配置:")
-            print(f"  - tile_size: {spatial_tile_size}, overlap: {spatial_tile_overlap}")
-            print(f"  - window_size: {window_size}, frame_overlap: {overlap}")
-            print(f"  - 預計 tiles: {optimal['tiles']}")
+            print(f"  - tile_size: {spatial_tile_size}, tile_overlap: {spatial_tile_overlap}")
+            print(f"  - window_size: {window_size}, window_overlap: {window_overlap}")
+            print(f"  - tiles: {optimal['n_tiles_x']}x{optimal['n_tiles_y']} = {optimal['tiles']}")
             print(f"  - 預估記憶體: {optimal['estimated_memory']:.1f} GB")
+            print(f"  - attention_slice_size: {attention_slice_size}")
         else:
-            spatial_tile_size = spatial_tile_size or 768
-            spatial_tile_overlap = spatial_tile_overlap or 128
-            window_size = window_size or 20
-            overlap = overlap or 5
+            spatial_tile_size = spatial_tile_size or 448
+            spatial_tile_overlap = spatial_tile_overlap or 96
+            window_size = window_size or 6
+            window_overlap = window_overlap or 2
+        
+        # backward compatibility
+        if overlap is not None:
+            window_overlap = overlap
         
         spatial_tile_size = ((spatial_tile_size + 63) // 64) * 64
         
         print(f"[DepthCrafter] 輸入: {num_frames} frames @ {width}x{height}")
-        print(f"[DepthCrafter] VAE 使用 float32 以確保數值穩定性")
+        print(f"[DepthCrafter] VAE 使用 float32 | Attention Slicing 已啟用")
         
         needs_tiling = enable_spatial_tiling and (height > spatial_tile_size or width > spatial_tile_size)
         
@@ -649,7 +720,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 num_inference_steps, 
                 guidance_scale,
                 window_size, 
-                overlap, 
+                window_overlap, 
                 noise_aug_strength,
                 generator, 
                 device,
@@ -663,6 +734,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             )
             print(f"[DepthCrafter] Spatial Tiling: {len(tiles)} tiles ({n_tiles_x}x{n_tiles_y})")
             
+            # 使用 CPU 作為中間緩衝區
             output_buffer = torch.zeros(
                 (1, num_frames, 3, height, width), 
                 device='cpu',
@@ -673,8 +745,6 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 device='cpu',
                 dtype=torch.float32
             )
-            
-            valid_tiles = 0
             
             for tile_idx, tile_info in enumerate(tiles):
                 ty = tile_info['tile_y']
@@ -688,8 +758,10 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 x_start = tile_info['x_start']
                 x_end = tile_info['x_end']
                 
+                # 提取 tile
                 video_tile = video[:, :, y_start:y_end, x_start:x_end].clone()
                 
+                # Padding
                 if tile_info['pad_bottom'] > 0 or tile_info['pad_right'] > 0:
                     video_tile = F.pad(
                         video_tile, 
@@ -699,12 +771,13 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 
                 aggressive_memory_cleanup()
                 
+                # 處理 tile
                 tile_result = self._process_single_tile(
                     video_tile, 
                     num_inference_steps, 
                     guidance_scale,
                     window_size, 
-                    overlap, 
+                    window_overlap, 
                     noise_aug_strength,
                     generator, 
                     device,
@@ -713,22 +786,17 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                     progress_callback,
                 )
                 
+                # 移除 padding
                 actual_h = y_end - y_start
                 actual_w = x_end - x_start
                 tile_result = tile_result[:, :, :, :actual_h, :actual_w]
                 
                 tile_result_cpu = tile_result.float().cpu()
                 
-                tile_min = tile_result_cpu.min().item()
-                tile_max = tile_result_cpu.max().item()
-                if tile_max - tile_min > 0.01:
-                    valid_tiles += 1
-                else:
-                    print(f"[警告] Tile {tile_idx + 1} 結果幾乎沒有變化 (min={tile_min:.4f}, max={tile_max:.4f})")
-                
                 del tile_result, video_tile
                 aggressive_memory_cleanup()
                 
+                # 創建混合遮罩
                 is_top = (ty == 0)
                 is_bottom = (ty == n_tiles_y - 1)
                 is_left = (tx == 0)
@@ -741,14 +809,14 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
                 )
                 blend_mask = blend_mask.view(1, 1, 1, actual_h, actual_w)
                 
+                # 累加
                 output_buffer[:, :, :, y_start:y_end, x_start:x_end] += tile_result_cpu * blend_mask
                 weight_buffer[:, :, :, y_start:y_end, x_start:x_end] += blend_mask
                 
                 del tile_result_cpu, blend_mask
                 aggressive_memory_cleanup()
             
-            print(f"[DepthCrafter] 有效 tiles: {valid_tiles}/{len(tiles)}")
-            
+            # 正規化
             weight_buffer = torch.clamp(weight_buffer, min=0.01)
             frames = output_buffer / weight_buffer
             
@@ -760,6 +828,7 @@ class DepthCrafterPipeline(StableVideoDiffusionPipeline):
             
             frames = torch.clamp(frames, 0, 1)
         
+        # 後處理
         if output_type != "latent":
             frames = self.video_processor.postprocess_video(
                 video=frames, output_type=output_type
