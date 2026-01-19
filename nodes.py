@@ -116,11 +116,6 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
         )
 
         # Model setup
-        # try:
-        #     pipe.enable_xformers_memory_efficient_attention()
-        # except Exception as e:
-        #     print(e)
-        #     print("Xformers is not enabled")
         pipe.enable_attention_slicing()
         
         if enable_model_cpu_offload:
@@ -129,7 +124,6 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
             pipe.enable_sequential_cpu_offload()
         else:
             pipe.to(device)
-
 
         depthcrafter_model = {
             "pipe": pipe,
@@ -140,31 +134,118 @@ class DownloadAndLoadDepthCrafterModel(DepthCrafterNode):
 
         return (depthcrafter_model,)
 
+
 class DepthCrafter(DepthCrafterNode):
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-            "depthcrafter_model": ("DEPTHCRAFTER_MODEL", ),
-            "images": ("IMAGE", ),
-            "force_size": ("BOOLEAN", {"default": True}),
-            "num_inference_steps": ("INT", {"default": 5, "min": 1, "max": 100}),
-            "guidance_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
-            "window_size": ("INT", {"default": 110, "min": 1, "max": 200}),
-            "overlap": ("INT", {"default": 25, "min": 0, "max": 100}),
-        }}
+        return {
+            "required": {
+                "depthcrafter_model": ("DEPTHCRAFTER_MODEL", ),
+                "images": ("IMAGE", ),
+                "force_size": ("BOOLEAN", {"default": True}),
+                "num_inference_steps": ("INT", {"default": 5, "min": 1, "max": 100}),
+                "guidance_scale": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "window_size": ("INT", {"default": 110, "min": 1, "max": 200}),
+                "overlap": ("INT", {"default": 25, "min": 0, "max": 100}),
+            },
+            "optional": {
+                # ==================== AMD/高解析度 Tiling 配置 ====================
+                "enable_spatial_tiling": ("BOOLEAN", {"default": True}),
+                "spatial_tile_size": ("INT", {
+                    "default": 768, 
+                    "min": 256, 
+                    "max": 1536, 
+                    "step": 64,
+                    "tooltip": "每個空間 tile 的處理尺寸（像素）。較小的值更省記憶體，但可能有更多接縫。必須是 64 的倍數。"
+                }),
+                "spatial_tile_overlap": ("INT", {
+                    "default": 128, 
+                    "min": 32, 
+                    "max": 384, 
+                    "step": 32,
+                    "tooltip": "空間 tiles 之間的重疊像素。較大的值可減少接縫但增加處理時間。"
+                }),
+                "vae_tile_size": ("INT", {
+                    "default": 256, 
+                    "min": 128, 
+                    "max": 512, 
+                    "step": 64,
+                    "tooltip": "VAE 內部 tiling 的大小。較小的值更省記憶體。"
+                }),
+                "vae_tile_overlap": ("INT", {
+                    "default": 64, 
+                    "min": 16, 
+                    "max": 128, 
+                    "step": 16,
+                    "tooltip": "VAE tiles 之間的重疊像素。"
+                }),
+                "vae_encode_chunk_size": ("INT", {
+                    "default": 1, 
+                    "min": 1, 
+                    "max": 8, 
+                    "step": 1,
+                    "tooltip": "每次 VAE encoding 處理的幀數。較小的值更省記憶體。對於 2K 影片建議設為 1。"
+                }),
+                "vae_decode_chunk_size": ("INT", {
+                    "default": 2, 
+                    "min": 1, 
+                    "max": 8, 
+                    "step": 1,
+                    "tooltip": "每次 VAE decoding 處理的幀數。較小的值更省記憶體。"
+                }),
+                # ==============================================================
+            }
+        }
     
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("depth_maps",)
     FUNCTION = "process"
     DESCRIPTION = """
-    Runs the DepthCrafter model on the input images.
-    **WARNING:** The model internally requires image dimensions (width and height)
-    to be multiples of 64. Enable 'force_size' to automatically resize the input
-    to the nearest valid dimensions, or ensure your input images already meet
-    this requirement if 'force_size' is disabled.
-    """
+Runs the DepthCrafter model on the input images.
+
+**Basic Parameters:**
+- force_size: Automatically resize input to multiples of 64
+- num_inference_steps: Denoising steps (more = better quality, slower)
+- guidance_scale: CFG scale
+- window_size: Temporal sliding window size (frames)
+- overlap: Overlap between temporal windows (frames)
+
+**AMD/High-Resolution Tiling Parameters (Optional):**
+These parameters enable processing of 2K+ resolution videos on GPUs with limited VRAM.
+
+- enable_spatial_tiling: Enable spatial tiling for high-resolution input
+- spatial_tile_size: Size of each spatial tile (768 recommended for 2K)
+- spatial_tile_overlap: Overlap between spatial tiles (128 recommended)
+- vae_tile_size: VAE internal tiling size
+- vae_tile_overlap: VAE internal tiling overlap
+- vae_encode_chunk_size: Frames per VAE encoding batch (1 for 2K)
+- vae_decode_chunk_size: Frames per VAE decoding batch
+
+**Memory Tips:**
+- For 2K video: spatial_tile_size=768, vae_encode_chunk_size=1
+- For 4K video: spatial_tile_size=512, vae_encode_chunk_size=1
+- If OOM: Reduce spatial_tile_size or vae_tile_size
+- If seams visible: Increase spatial_tile_overlap
+"""
     
-    def process(self, depthcrafter_model, images, force_size, num_inference_steps, guidance_scale, window_size, overlap):
+    def process(
+        self, 
+        depthcrafter_model, 
+        images, 
+        force_size, 
+        num_inference_steps, 
+        guidance_scale, 
+        window_size, 
+        overlap,
+        # Optional AMD/Tiling parameters with defaults
+        enable_spatial_tiling=True,
+        spatial_tile_size=768,
+        spatial_tile_overlap=128,
+        vae_tile_size=256,
+        vae_tile_overlap=64,
+        vae_encode_chunk_size=1,
+        vae_decode_chunk_size=2,
+    ):
         device = depthcrafter_model['device']
         pipe = depthcrafter_model['pipe']
         
@@ -209,16 +290,39 @@ class DepthCrafter(DepthCrafterNode):
             width = W
             height = H
 
+        # 顯示 tiling 配置資訊
+        max_dim = max(height, width)
+        if enable_spatial_tiling and max_dim > spatial_tile_size:
+            n_tiles_y = max(1, (height - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
+            n_tiles_x = max(1, (width - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
+            total_tiles = n_tiles_y * n_tiles_x
+            print(f"DepthCrafter: Spatial Tiling enabled - {total_tiles} tiles ({n_tiles_x}x{n_tiles_y})")
+            print(f"  - Tile size: {spatial_tile_size}, Overlap: {spatial_tile_overlap}")
+            print(f"  - VAE tile size: {vae_tile_size}, VAE overlap: {vae_tile_overlap}")
+            print(f"  - VAE encode chunk: {vae_encode_chunk_size}, VAE decode chunk: {vae_decode_chunk_size}")
+        else:
+            print(f"DepthCrafter: Processing at {width}x{height} (no spatial tiling needed)")
+
         # Permute images to [t, c, h, w] for the pipeline
         images = images.permute(0, 3, 1, 2)  # [B, C, H, W]
         images = images.to(device=device, dtype=torch.float16)
         images = torch.clamp(images, 0, 1)
         
-        # Calculate total num of steps
-        num_windows = math.ceil((B - window_size) / (window_size - overlap)) + 1
-        self.start_progress(num_inference_steps * num_windows)
+        # Calculate total num of steps for progress bar
+        if enable_spatial_tiling and max_dim > spatial_tile_size:
+            # Estimate tiles
+            n_tiles_y = max(1, (height - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
+            n_tiles_x = max(1, (width - spatial_tile_overlap + spatial_tile_size - spatial_tile_overlap - 1) // (spatial_tile_size - spatial_tile_overlap))
+            total_tiles = n_tiles_y * n_tiles_x
+            num_windows = math.ceil((B - window_size) / (window_size - overlap)) + 1 if B > window_size else 1
+            total_steps = num_inference_steps * num_windows * total_tiles
+        else:
+            num_windows = math.ceil((B - window_size) / (window_size - overlap)) + 1 if B > window_size else 1
+            total_steps = num_inference_steps * num_windows
+            
+        self.start_progress(total_steps)
         
-        # Run the pipeline
+        # Run the pipeline with tiling parameters
         with torch.inference_mode():
             result = pipe(
                 images,
@@ -231,6 +335,14 @@ class DepthCrafter(DepthCrafterNode):
                 overlap=overlap,
                 track_time=False,
                 progress_callback=self.update_progress,
+                # AMD/Tiling parameters
+                enable_spatial_tiling=enable_spatial_tiling,
+                spatial_tile_size=spatial_tile_size,
+                spatial_tile_overlap=spatial_tile_overlap,
+                vae_tile_size=vae_tile_size,
+                vae_tile_overlap=vae_tile_overlap,
+                vae_encode_chunk_size=vae_encode_chunk_size,
+                vae_decode_chunk_size=vae_decode_chunk_size,
             )
             
         res = result.frames[0]  # [B, H, W, C]
@@ -250,3 +362,15 @@ class DepthCrafter(DepthCrafterNode):
         self.end_progress()
         
         return (depth_maps,)
+
+
+# Node mappings
+NODE_CLASS_MAPPINGS = {
+    "DownloadAndLoadDepthCrafterModel": DownloadAndLoadDepthCrafterModel,
+    "DepthCrafter": DepthCrafter,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "DownloadAndLoadDepthCrafterModel": "Download And Load DepthCrafter Model",
+    "DepthCrafter": "DepthCrafter",
+}
